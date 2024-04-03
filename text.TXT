@@ -1,0 +1,228 @@
+msg := time.Now().Format("2006-01-02 15:04:05") + "[" + client.name + "]:" + string(message)
+
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"os"
+	"reflect"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+)
+
+// Client structure
+type Client struct {
+	conn     net.Conn
+	name     string
+	id       string
+	hub      *Hub
+	ch       chan []byte
+	h        sync.Map
+}
+
+// Hub structure
+type Hub struct {
+	clients    sync.Map
+	broadcast  chan []byte
+	register   chan *Client
+	unregister chan *Client
+	msgChannels chan *Client
+}
+
+// Connection structure
+type connection struct {
+	client *Client
+	conn   net.Conn
+	reader *bufio.Reader
+}
+
+// Broadcast message
+func (hub *Hub) broadcastMessage(client *Client, message []byte) {
+	if len(message) > 0 {
+		msg := time.Now().Format("2006-01-02 15:04:05") + "[" + client.name + "]:" + string(message)
+		hub.broadcast <- []byte(msg)
+	}
+}
+
+// Hub methods to handle new connections
+func (hub *Hub) addClient(client *Client) {
+	if !hub.clients.Load(client.id).(bool) {
+		hub.clients.Store(client.id, true)
+	}
+	fmt.Println(client.name + " has joined our chat...")
+	hub.register <- client
+	for k, v := range hub.clients.Load().(sync.Map).Range() {
+		if c, ok := v.(*Client); ok {
+			client.h.Store(c.id, c)
+		}
+	}
+	current := reflect.ValueOf(client.h.Load()).Elem()
+	fmt.Printf("%v clients connected: %v\n", runtime.NumGoroutine()-1, current.MapRange().Len())
+	fmt.Println(current.MapRange().Len())
+}
+
+func (hub *Hub) removeClient(client*Client) {
+	fmt.Println(client.name + " has left our chat...")
+	hub.unregister <- client
+	delete(client.h.Load().(sync.Map), client.id)
+	hub.clients.Delete(client.id)
+}
+
+// Hub server
+func (hub *Hub) serve() {
+	for {
+		select {
+		case client := <-hub.register:
+			hub.broadcast <- []byte(client.name + " has joined our chat...")
+			client.hub.msgChannels <- client
+			for k, v := range hub.clients.Load().(sync.Map).Range() {
+				client := v.(*Client)
+				client.conn.Write([]byte(client.name + " has joined our chat..."))
+			}
+		case client := <-hub.unregister:
+			if client.h.Load() != nil {
+				for _, v := range client.h.Load().(sync.Map).Range() {
+					rm, ok := v.(*Client)
+					if ok {
+						hub.broadcast <- []byte(rm.name + " has left our chat...")
+					}
+				}
+			}
+			delete(client.h.Load().(sync.Map), client.id)
+			hub.clients.Delete(client.id)
+		case msg := <-hub.broadcast:
+			for k, v := range hub.clients.Load().(sync.Map).Range() {
+				client := v.(*Client)
+				client.conn.Write(msg)
+			}
+		}
+	}
+}
+
+// Handle new connections to the server
+func (c *connection) startRead() {
+	for {
+		msg, err := c.reader.ReadString('\n')
+		if err == io.EOF {
+			c.client.hub.removeClient(c.client)
+			c.conn.Close()
+			return
+		}
+		if err != nil {
+			c.client.hub.removeClient(c.client)
+			c.conn.Close()
+			return
+		}
+		c.client.hub.broadcast <- msg
+	}
+}
+
+// Handle the server
+func (c *Clients) start() {
+	c.ch = make(chan []byte)
+	go c.startRead()
+}
+
+// Connected handle (client)
+func (c *Clients) handleConnection(err error) {
+	if err != nil {
+		log.Fatal("ListenAndServe: ", err)
+	}
+
+	fmt.Print("Listening on the port :8989\n")
+	for {
+		conn, err := c.listener.Accept()
+		if err != nil {
+			fmt.Println("Accept: ", err)
+			continue
+		}
+		go c.handleRequest(conn)
+	}
+}
+
+// Print netcat logo
+func printLogo() {
+	fmt.Print(`
+		 _nnnn_
+		 dGGGGMMb
+		@p~qp~~qMb
+		M|@||@) M|
+		@,----.JM|
+	   JS^\__/  qKL
+	  dZP        qKRb
+	 dZP          qKKb
+	fZP            SMMb
+	HZM            MMMM
+	FqM            MMMM
+   __| ".        |\dS"qML
+   |    `.       | `' \Zq
+  _)      \.___.,|     .'
+  \____   )MMMMMP|   .'
+	  `-'       `--'		
+	  		')`)
+}
+
+// Client request handle
+func (c *Clients) handleRequest(conn net.Conn) {
+	reader := bufio.NewReader(conn)
+	printLoGo := printLogo()
+	fmt.Fprint(conn, printLoGo)
+	name := strings.TrimSpace(reader.ReadString('\n'))
+	fmt.Print("Received: ", name+"\n")
+
+	if name == "" {
+		conn.Write([]byte("Error: Name is empty!\n"))
+		conn.Close()
+		return
+	}
+
+	// Initiate the client
+	client := &Client{
+		name:  name,
+		id:    fmt.Sprintf("%p", &conn),
+		conn:  conn,
+		reader: reader,
+		hub: &Hub{
+			broadcast:  make(chan []byte),
+			register:   make(chan *Client),
+			unregister: make(chan *Client),
+			msgChannels: make(chan *Client, 10),
+		},
+	}
+
+	client.hub.addClient(client)
+	client.start()
+	client.hub.serve()
+}
+
+// Main
+func main() {
+	// Get address to listen on
+	args := os.Args[1:]
+	if len(args) == 1 {
+		port := "8989"
+		if args[0] != "" {
+			port = args[0]
+		}
+
+		// Create a listener
+		listener, err := net.Listen("tcp", ":"+port)
+		if err != nil {
+			fmt.Println(err)
+		}
+		defer listener.Close()
+
+		// Create connections
+		c := &Clients{listener}
+		// Start server
+		c.handleConnection(err)
+	} else {
+		fmt.Println("Usage: go run . $port")
+	}
+}
